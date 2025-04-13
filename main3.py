@@ -20,6 +20,13 @@ class MPU6050:
         self.power_mgmt_1 = 0x6b
         self.power_mgmt_2 = 0x6c
         
+        # For filtering and smoothing
+        self.last_accel = {'x': 0, 'y': 0, 'z': 0}
+        self.last_gyro = {'x': 0, 'y': 0, 'z': 0}
+        self.filtered_pitch = 0
+        self.filtered_roll = 0
+        self.filtered_yaw = 0
+        
         # Initialize I2C bus
         try:
             self.bus = smbus.SMBus(1)
@@ -48,27 +55,49 @@ class MPU6050:
             return 0
     
     def read_accel_data(self):
-        """Read accelerometer data"""
+        """Read accelerometer data with filtering"""
         if not self.sensor_available:
             return {'x': 0, 'y': 0, 'z': 0}
         try:
-            accel_x = self.read_word(0x3b) / 16384.0  # Divide by sensitivity scale factor for ±2g
+            # Read raw data
+            accel_x = self.read_word(0x3b) / 16384.0
             accel_y = self.read_word(0x3d) / 16384.0
             accel_z = self.read_word(0x3f) / 16384.0
-            return {'x': accel_x, 'y': accel_y, 'z': accel_z}
+            
+            # Apply low pass filter - adjust alpha for more/less smoothing
+            alpha = 0.2  # Lower = more filtering (0.05 to 0.3 is a good range)
+            self.last_accel['x'] = alpha * accel_x + (1 - alpha) * self.last_accel['x']
+            self.last_accel['y'] = alpha * accel_y + (1 - alpha) * self.last_accel['y']
+            self.last_accel['z'] = alpha * accel_z + (1 - alpha) * self.last_accel['z']
+            
+            return self.last_accel
         except Exception as e:
             print(f"Error reading accelerometer data: {e}")
             return {'x': 0, 'y': 0, 'z': 0}
     
     def read_gyro_data(self):
-        """Read gyroscope data"""
+        """Read gyroscope data with filtering"""
         if not self.sensor_available:
             return {'x': 0, 'y': 0, 'z': 0}
         try:
-            gyro_x = self.read_word(0x43) / 131.0  # Divide by sensitivity scale factor for ±250°/s
+            # Read raw data
+            gyro_x = self.read_word(0x43) / 131.0
             gyro_y = self.read_word(0x45) / 131.0
             gyro_z = self.read_word(0x47) / 131.0
-            return {'x': gyro_x, 'y': gyro_y, 'z': gyro_z}
+            
+            # Apply dead zone filter to reduce noise when stationary
+            dead_zone = 0.5
+            if abs(gyro_x) < dead_zone: gyro_x = 0
+            if abs(gyro_y) < dead_zone: gyro_y = 0
+            if abs(gyro_z) < dead_zone: gyro_z = 0
+            
+            # Apply low pass filter
+            alpha = 0.1  # Lower = more filtering
+            self.last_gyro['x'] = alpha * gyro_x + (1 - alpha) * self.last_gyro['x']
+            self.last_gyro['y'] = alpha * gyro_y + (1 - alpha) * self.last_gyro['y']
+            self.last_gyro['z'] = alpha * gyro_z + (1 - alpha) * self.last_gyro['z']
+            
+            return self.last_gyro
         except Exception as e:
             print(f"Error reading gyroscope data: {e}")
             return {'x': 0, 'y': 0, 'z': 0}
@@ -85,39 +114,58 @@ class MPU6050:
             return 0
     
     def get_rotation_angles(self):
-        """Calculate pitch and roll from accelerometer data"""
+        """Calculate pitch and roll using complementary filter"""
         if not self.sensor_available:
             return {'pitch': 0, 'roll': 0, 'yaw': 0}
         try:
             accel = self.read_accel_data()
             gyro = self.read_gyro_data()
             
-            # Simple complementary filter for more stable readings would be implemented here
-            # This is a simplified calculation
-            roll = math.atan2(accel['y'], accel['z']) * 180/math.pi
-            pitch = math.atan2(-accel['x'], math.sqrt(accel['y']*accel['y'] + accel['z']*accel['z'])) * 180/math.pi
+            # Calculate angles from accelerometer
+            accel_roll = math.atan2(accel['y'], accel['z']) * 180/math.pi
+            accel_pitch = math.atan2(-accel['x'], math.sqrt(accel['y']*accel['y'] + accel['z']*accel['z'])) * 180/math.pi
             
-            # We use the gyro value directly for yaw, as the MPU6050 can't determine absolute heading
-            # In a real implementation, you'd want to integrate the gyro_z value over time
-            yaw = gyro['z']  # This is just the rotation rate, not absolute position
+            # Get time difference (assuming a fixed update rate)
+            dt = 1/30.0  # 30 Hz update rate
             
-            return {'pitch': pitch, 'roll': roll, 'yaw': yaw}
+            # Complementary filter - combine accelerometer and gyro data
+            # Adjust the filter coefficient for more/less gyro influence
+            filter_coef = 0.98
+            self.filtered_roll = filter_coef * (self.filtered_roll + gyro['x'] * dt) + (1 - filter_coef) * accel_roll
+            self.filtered_pitch = filter_coef * (self.filtered_pitch + gyro['y'] * dt) + (1 - filter_coef) * accel_pitch
+            
+            # For yaw, we just slowly track the filtered gyro_z
+            # Scale down the yaw sensitivity
+            self.filtered_yaw += gyro['z'] * dt * 0.3  # Scale factor to reduce sensitivity
+            
+            return {
+                'pitch': self.filtered_pitch, 
+                'roll': self.filtered_roll, 
+                'yaw': self.filtered_yaw
+            }
         except Exception as e:
             print(f"Error calculating rotation angles: {e}")
             return {'pitch': 0, 'roll': 0, 'yaw': 0}
     
     def estimate_speed(self):
-        """Estimate relative speed from accelerometer data - very approximate"""
+        """Estimate relative speed with much reduced sensitivity"""
         if not self.sensor_available:
             return 0
         try:
             accel = self.read_accel_data()
-            # This is a very simplified approximation - actual speed calculation 
-            # would require integration of acceleration over time
-            magnitude = math.sqrt(accel['x']**2 + accel['y']**2 + accel['z']**2)
-            # Map the magnitude to a speed range (0-200 km/h)
-            # This is purely demonstrative and not accurate
-            speed = (magnitude - 1.0) * 100  # 1g is baseline
+            
+            # Calculate acceleration magnitude (removing gravity)
+            accel_z_without_gravity = accel['z'] - 1.0  # Remove 1g (approximation)
+            magnitude = math.sqrt(accel['x']**2 + accel['y']**2 + accel_z_without_gravity**2)
+            
+            # Use a dead zone to filter out small movements
+            if magnitude < 0.05:
+                magnitude = 0
+                
+            # Significantly reduced sensitivity
+            speed = magnitude * 25  # Much lower scale factor
+            
+            # Smoothly approach the target speed rather than jump
             return max(0, min(200, speed))  # Clamp between 0-200
         except Exception as e:
             print(f"Error estimating speed: {e}")
