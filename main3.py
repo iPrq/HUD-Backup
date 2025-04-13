@@ -27,6 +27,10 @@ class MPU6050:
         self.filtered_roll = 0
         self.filtered_yaw = 0
         
+        # Previous readings for damping
+        self.prev_accel = {'x': 0, 'y': 0, 'z': 0}
+        self.prev_gyro = {'x': 0, 'y': 0, 'z': 0}
+        
         # Initialize I2C bus
         try:
             self.bus = smbus.SMBus(1)
@@ -55,7 +59,7 @@ class MPU6050:
             return 0
     
     def read_accel_data(self):
-        """Read accelerometer data with filtering"""
+        """Read accelerometer data with heavy filtering"""
         if not self.sensor_available:
             return {'x': 0, 'y': 0, 'z': 0}
         try:
@@ -64,8 +68,17 @@ class MPU6050:
             accel_y = self.read_word(0x3d) / 16384.0
             accel_z = self.read_word(0x3f) / 16384.0
             
-            # Apply low pass filter - adjust alpha for more/less smoothing
-            alpha = 0.2  # Lower = more filtering (0.05 to 0.3 is a good range)
+            # Apply very strong dead zone filter first
+            dead_zone = 0.05
+            if abs(accel_x - self.prev_accel['x']) < dead_zone: accel_x = self.prev_accel['x']
+            if abs(accel_y - self.prev_accel['y']) < dead_zone: accel_y = self.prev_accel['y']
+            if abs(accel_z - self.prev_accel['z']) < dead_zone: accel_z = self.prev_accel['z']
+            
+            # Update previous values
+            self.prev_accel = {'x': accel_x, 'y': accel_y, 'z': accel_z}
+            
+            # Apply very strong low pass filter - much lower alpha for more filtering
+            alpha = 0.05  # Very low value = very strong filtering (0.01 to 0.1 range)
             self.last_accel['x'] = alpha * accel_x + (1 - alpha) * self.last_accel['x']
             self.last_accel['y'] = alpha * accel_y + (1 - alpha) * self.last_accel['y']
             self.last_accel['z'] = alpha * accel_z + (1 - alpha) * self.last_accel['z']
@@ -76,7 +89,7 @@ class MPU6050:
             return {'x': 0, 'y': 0, 'z': 0}
     
     def read_gyro_data(self):
-        """Read gyroscope data with filtering"""
+        """Read gyroscope data with heavy filtering"""
         if not self.sensor_available:
             return {'x': 0, 'y': 0, 'z': 0}
         try:
@@ -85,14 +98,26 @@ class MPU6050:
             gyro_y = self.read_word(0x45) / 131.0
             gyro_z = self.read_word(0x47) / 131.0
             
-            # Apply dead zone filter to reduce noise when stationary
-            dead_zone = 0.5
+            # Apply much larger dead zone filter to reduce noise when stationary
+            dead_zone = 1.5  # Increased from 0.5 to 1.5
             if abs(gyro_x) < dead_zone: gyro_x = 0
             if abs(gyro_y) < dead_zone: gyro_y = 0
             if abs(gyro_z) < dead_zone: gyro_z = 0
             
-            # Apply low pass filter
-            alpha = 0.1  # Lower = more filtering
+            # Apply rate limiter to prevent sudden jumps in gyro readings
+            max_change = 2.0
+            if abs(gyro_x - self.prev_gyro['x']) > max_change:
+                gyro_x = self.prev_gyro['x'] + max_change * (1 if gyro_x > self.prev_gyro['x'] else -1)
+            if abs(gyro_y - self.prev_gyro['y']) > max_change:
+                gyro_y = self.prev_gyro['y'] + max_change * (1 if gyro_y > self.prev_gyro['y'] else -1)
+            if abs(gyro_z - self.prev_gyro['z']) > max_change:
+                gyro_z = self.prev_gyro['z'] + max_change * (1 if gyro_z > self.prev_gyro['z'] else -1)
+            
+            # Update previous values
+            self.prev_gyro = {'x': gyro_x, 'y': gyro_y, 'z': gyro_z}
+            
+            # Apply very low pass filter with more aggressive filtering
+            alpha = 0.05  # Lower = more filtering
             self.last_gyro['x'] = alpha * gyro_x + (1 - alpha) * self.last_gyro['x']
             self.last_gyro['y'] = alpha * gyro_y + (1 - alpha) * self.last_gyro['y']
             self.last_gyro['z'] = alpha * gyro_z + (1 - alpha) * self.last_gyro['z']
@@ -114,7 +139,7 @@ class MPU6050:
             return 0
     
     def get_rotation_angles(self):
-        """Calculate pitch and roll using complementary filter"""
+        """Calculate pitch and roll using complementary filter with reduced sensitivity"""
         if not self.sensor_available:
             return {'pitch': 0, 'roll': 0, 'yaw': 0}
         try:
@@ -129,14 +154,18 @@ class MPU6050:
             dt = 1/30.0  # 30 Hz update rate
             
             # Complementary filter - combine accelerometer and gyro data
-            # Adjust the filter coefficient for more/less gyro influence
-            filter_coef = 0.98
-            self.filtered_roll = filter_coef * (self.filtered_roll + gyro['x'] * dt) + (1 - filter_coef) * accel_roll
-            self.filtered_pitch = filter_coef * (self.filtered_pitch + gyro['y'] * dt) + (1 - filter_coef) * accel_pitch
+            # Higher filter_coef = more gyro influence = smoother but may drift
+            # Lower filter_coef = more accel influence = less drift but more noise
+            filter_coef = 0.995  # Increased from 0.98 for much more filtering
             
-            # For yaw, we just slowly track the filtered gyro_z
-            # Scale down the yaw sensitivity
-            self.filtered_yaw += gyro['z'] * dt * 0.3  # Scale factor to reduce sensitivity
+            # Scale down gyro influence significantly
+            gyro_scale = 0.3  # Reduce gyro influence by 70%
+            
+            self.filtered_roll = filter_coef * (self.filtered_roll + gyro['x'] * dt * gyro_scale) + (1 - filter_coef) * accel_roll
+            self.filtered_pitch = filter_coef * (self.filtered_pitch + gyro['y'] * dt * gyro_scale) + (1 - filter_coef) * accel_pitch
+            
+            # For yaw, drastically reduce sensitivity
+            self.filtered_yaw += gyro['z'] * dt * 0.1  # Reduced from 0.3 to 0.1
             
             return {
                 'pitch': self.filtered_pitch, 
@@ -148,7 +177,7 @@ class MPU6050:
             return {'pitch': 0, 'roll': 0, 'yaw': 0}
     
     def estimate_speed(self):
-        """Estimate relative speed with much reduced sensitivity"""
+        """Estimate relative speed with extremely reduced sensitivity"""
         if not self.sensor_available:
             return 0
         try:
@@ -158,12 +187,12 @@ class MPU6050:
             accel_z_without_gravity = accel['z'] - 1.0  # Remove 1g (approximation)
             magnitude = math.sqrt(accel['x']**2 + accel['y']**2 + accel_z_without_gravity**2)
             
-            # Use a dead zone to filter out small movements
-            if magnitude < 0.05:
+            # Use a much larger dead zone to filter out small movements
+            if magnitude < 0.1:  # Increased from 0.05
                 magnitude = 0
                 
-            # Significantly reduced sensitivity
-            speed = magnitude * 25  # Much lower scale factor
+            # Drastically reduced sensitivity
+            speed = magnitude * 10  # Reduced from 25 to 10
             
             # Smoothly approach the target speed rather than jump
             return max(0, min(200, speed))  # Clamp between 0-200
@@ -186,14 +215,12 @@ class StarkHUDWidget(Widget):
         self.system_status = "ALL SYSTEMS NOMINAL"
         self.scan_angle = 0
         self.data_points = []
-        
         # Initialize the MPU6050 sensor
         self.mpu = MPU6050()
         
         # Initialize data points for visualization
         for _ in range(30):
             self.data_points.append(0.5)  # Start with neutral values
-            
         Clock.schedule_interval(self.update, 1/30)  # 30 FPS update rate
         
     def update(self, dt):
@@ -201,7 +228,6 @@ class StarkHUDWidget(Widget):
         angles = self.mpu.get_rotation_angles()
         self.pitch = angles['pitch']
         self.roll = angles['roll']
-        
         # Update heading based on MPU6050 yaw rate
         # In a real application, you would need to integrate the yaw rate over time
         # This is simplified for demonstration
@@ -264,20 +290,18 @@ class StarkHUDWidget(Widget):
         
         start_x = center_x - width/2
         start_y = center_y - height/2
-        
+                    
         for row in range(rows):
             for col in range(cols):
                 # Stagger every other row
                 offset_x = hex_size * 0.75 if row % 2 else 0
-                
                 x = start_x + col * hex_size * 1.5 + offset_x
                 y = start_y + row * hex_size * 1.732
-                
                 # Only draw if in visible area and not in center (to keep center cleaner)
                 dist_from_center = math.sqrt((x - center_x)**2 + (y - center_y)**2)
                 if 0 < x < self.width and 0 < y < self.height and dist_from_center > 100:
                     self.draw_hexagon(x, y, hex_size/3)
-
+                    
     def draw_hexagon(self, x, y, size):
         points = []
         for i in range(6):
@@ -287,7 +311,7 @@ class StarkHUDWidget(Widget):
                 y + size * math.sin(angle)
             ])
         Line(points=points, width=1, close=True)
-
+        
     def draw_targeting_reticle(self, x, y):
         # Main targeting reticle - Iron Man style circular elements
         reticle_size = 120
@@ -401,7 +425,7 @@ class StarkHUDWidget(Widget):
                 
                 Line(points=[x - line_length/2, ladder_y, 
                              x + line_length/2, ladder_y], width=1)
-                             
+                
                 # Add degree numbers for major angles
                 if degrees % 30 == 0:
                     degree_label = CoreLabel(text=f"{abs(degrees)}°", font_size=10)
@@ -421,7 +445,7 @@ class StarkHUDWidget(Widget):
         # Central dot
         Line(circle=(x, y, 2), width=2)
         
-        # Aircraft wings
+        # Aircraft wings          
         wing_width = 25
         Line(points=[x - wing_width, y, x - 10, y], width=2)
         Line(points=[x + 10, y, x + wing_width, y], width=2)
@@ -433,7 +457,6 @@ class StarkHUDWidget(Widget):
         value_x = x + attitude_size + 15
         value_y = y + 40
         spacing = 20
-        
         Color(0, 0.7, 0.9, 0.9)
         
         # Pitch value
@@ -471,7 +494,6 @@ class StarkHUDWidget(Widget):
             
             # Longer ticks for major angles
             tick_length = 10 if roll_angle % 30 == 0 else 5
-            
             inner_x = x + (roll_indicator_radius - tick_length) * math.cos(angle_rad)
             inner_y = y + (roll_indicator_radius - tick_length) * math.sin(angle_rad)
             
@@ -643,7 +665,7 @@ class StarkHUDWidget(Widget):
         ]
         Triangle(points=triangle_points)
         
-        # Altitude text at top
+        # Altitude text at top:
         Color(1, 1, 1, 0.9)
         label = CoreLabel(text="ALTITUDE", font_size=12)
         label.refresh()
@@ -673,7 +695,7 @@ class StarkHUDWidget(Widget):
             x = 10 + i * (bar_width + bar_spacing)
             y = 120
             Rectangle(pos=(x, y), size=(bar_width, height))
-            
+        
         # Right edge
         for i in range(num_bars):
             height = self.data_points[(i+10) % len(self.data_points)] * 50
